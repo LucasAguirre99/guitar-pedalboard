@@ -9,6 +9,7 @@ from tkinter import ttk, messagebox
 import threading
 import time
 import uuid
+import math
 import numpy as np
 from typing import Dict, List, Optional, Any
 
@@ -370,6 +371,42 @@ class AudioEngine:
             self._pedalboard = Pedalboard(plugins)
 
 
+# ─── Estilos visuales de pedales (inspirados en modelos famosos) ─────────────
+
+PEDAL_STYLES: Dict[str, Any] = {
+    "Volumen":         {"brand": "BOSS",   "model": "FV-500H",   "body": "#b8b8b8", "accent": "#808080", "knob_color": "#222222", "knobs": ["VOL"]},
+    "Distorsion":      {"brand": "BOSS",   "model": "DS-1",      "body": "#e8921a", "accent": "#c07010", "knob_color": "#1a1a1a", "knobs": ["LVL", "TONE", "DIST"]},
+    "Overdrive":       {"brand": "IBANEZ", "model": "TS9",       "body": "#2e7d32", "accent": "#1b5e20", "knob_color": "#1a1a1a", "knobs": ["DRIVE", "TONE", "LVL"]},
+    "Reverb":          {"brand": "BOSS",   "model": "RV-6",      "body": "#0277bd", "accent": "#01579b", "knob_color": "#1a1a1a", "knobs": ["LVL", "TIME", "TONE"]},
+    "Delay":           {"brand": "BOSS",   "model": "DD-3",      "body": "#f9a825", "accent": "#e65100", "knob_color": "#1a1a1a", "knobs": ["LVL", "F.B.", "TIME"]},
+    "Chorus":          {"brand": "BOSS",   "model": "CE-5",      "body": "#1565c0", "accent": "#0d47a1", "knob_color": "#dddddd", "knobs": ["LVL", "RATE", "DEPTH"]},
+    "Phaser":          {"brand": "MXR",    "model": "Phase 90",  "body": "#e65100", "accent": "#bf360c", "knob_color": "#111111", "knobs": ["SPEED"]},
+    "Compresor":       {"brand": "MXR",    "model": "Dyna Comp", "body": "#c62828", "accent": "#8e0000", "knob_color": "#111111", "knobs": ["OUTPUT", "SENS"]},
+    "Puerta de Ruido": {"brand": "BOSS",   "model": "NS-2",      "body": "#1a237e", "accent": "#0d1466", "knob_color": "#cccccc", "knobs": ["THRES.", "DECAY"]},
+    "Filtro Agudos":   {"brand": "EHX",    "model": "Knockout",  "body": "#880e4f", "accent": "#560027", "knob_color": "#111111", "knobs": ["FREQ"]},
+    "Filtro Graves":   {"brand": "EHX",    "model": "Bass Boost","body": "#1b5e20", "accent": "#003300", "knob_color": "#111111", "knobs": ["FREQ"]},
+    "Pitch Shift":     {"brand": "BOSS",   "model": "PS-6",      "body": "#6a1b9a", "accent": "#4a0072", "knob_color": "#111111", "knobs": ["PITCH", "MODE"]},
+}
+
+
+def _lighten(hex_color: str, amount: int = 40) -> str:
+    h = hex_color.lstrip("#")
+    return "#{:02x}{:02x}{:02x}".format(
+        min(255, int(h[0:2], 16) + amount),
+        min(255, int(h[2:4], 16) + amount),
+        min(255, int(h[4:6], 16) + amount),
+    )
+
+
+def _darken(hex_color: str, amount: int = 40) -> str:
+    h = hex_color.lstrip("#")
+    return "#{:02x}{:02x}{:02x}".format(
+        max(0, int(h[0:2], 16) - amount),
+        max(0, int(h[2:4], 16) - amount),
+        max(0, int(h[4:6], 16) - amount),
+    )
+
+
 # ─── Interfaz grafica ─────────────────────────────────────────────────────────
 
 BG         = "#1a1a2e"
@@ -675,81 +712,143 @@ class GuitarPedalboardApp(tk.Tk):
             return
 
         self.empty_lbl.pack_forget()
-        self.chain_canvas.configure(height=210)
+        self.chain_canvas.configure(height=255)
 
         for i, pedal in enumerate(self.chain):
             if i > 0:
                 tk.Label(self.chain_inner, text="->", bg=BG, fg="#334455",
                          font=("Helvetica", 18)).pack(side="left", padx=2)
-            self._draw_pedal_box(self.chain_inner, pedal, i)
+            self._draw_pedal_canvas(self.chain_inner, pedal, i)
 
         self.chain_canvas.update_idletasks()
         self._on_chain_resize()
 
-    def _draw_pedal_box(self, parent: tk.Widget, pedal: ActivePedal, idx: int):
-        color = pedal.color if pedal.enabled else "#2a2a3a"
-        border = "#ffffff" if (pedal is self.selected) else "#333344"
-        fg_text = "white" if pedal.enabled else "#556"
+    def _draw_pedal_canvas(self, parent: tk.Widget, pedal: ActivePedal, idx: int):
+        style   = PEDAL_STYLES[pedal.pedal_type]
+        enabled = pedal.enabled
+        selected = (pedal is self.selected)
 
-        # Marco exterior (borde de seleccion)
-        outer = tk.Frame(parent, bg=border, padx=2, pady=2)
-        outer.pack(side="left", padx=4, pady=12)
+        W, H = 122, 205   # dimensiones del canvas
 
-        # Cuerpo del pedal
-        box = tk.Frame(outer, bg=color, width=118, height=185, padx=6, pady=6)
-        box.pack()
-        box.pack_propagate(False)
+        body   = style["body"]   if enabled else "#3a3a4a"
+        accent = style["accent"] if enabled else "#2a2a3a"
+        light  = _lighten(body, 55) if enabled else "#4a4a5a"
+        shadow = _darken(body, 45)
+        kfill  = style["knob_color"] if enabled else "#333344"
+        txt    = "#f0f0f0" if enabled else "#666677"
 
-        # Nombre
-        tk.Label(box, text=pedal.pedal_type, bg=color, fg=fg_text,
-                 font=FONT_BOLD, wraplength=106).pack(pady=(4, 0))
+        border_color = "#ffffff" if selected else "#1a1a2e"
+        outer = tk.Frame(parent, bg=border_color, padx=2, pady=2)
+        outer.pack(side="left", padx=3, pady=8)
 
-        # LED
-        led = "#00ff44" if pedal.enabled else "#2a2a2a"
-        tk.Label(box, text="●", bg=color, fg=led,
-                 font=("Helvetica", 14)).pack()
+        cv = tk.Canvas(outer, width=W, height=H, bg="#111111",
+                       highlightthickness=0, cursor="hand2")
+        cv.pack()
 
-        # Vista previa de parametros (primeros 3)
-        defn = PEDALS[pedal.pedal_type]["params"]
-        for key, meta in list(defn.items())[:3]:
-            val = pedal.params[key]
-            tk.Label(box, text=f"{meta['label']}: {val:.2f}{meta['unit']}",
-                     bg=color, fg=fg_text, font=("Helvetica", 7),
-                     wraplength=106).pack()
+        # ── Cuerpo metalico ─────────────────────────────────
+        cv.create_rectangle(6, 6, W - 4, H - 38, fill="#0a0a0a", outline="")  # sombra
+        cv.create_rectangle(4, 4, W - 6, H - 40, fill=body, outline=shadow, width=1)
+        cv.create_line(4,    4, W - 6,    4, fill=light, width=2)   # borde superior
+        cv.create_line(4,    4,    4, H - 40, fill=light, width=2)  # borde izquierdo
+        cv.create_line(4, H-40, W - 6, H - 40, fill=shadow, width=1)
+        cv.create_line(W-6,  4, W - 6, H - 40, fill=shadow, width=1)
 
-        # Fila de botones
-        btn_row = tk.Frame(box, bg=color)
-        btn_row.pack(side="bottom", fill="x", pady=(6, 0))
+        # ── Marca (brand) ────────────────────────────────────
+        cv.create_text(W // 2, 14, text=style["brand"], fill=txt,
+                       font=("Helvetica", 7, "bold"))
 
-        onoff_bg = "#2d6a2d" if pedal.enabled else "#6a2d2d"
-        onoff_txt = "ON" if pedal.enabled else "OFF"
-        tk.Button(btn_row, text=onoff_txt, bg=onoff_bg, fg="white",
-                  font=("Helvetica", 7, "bold"), relief="flat", padx=4,
-                  cursor="hand2",
-                  command=lambda p=pedal: self._toggle_pedal(p)).pack(side="left", fill="x", expand=True)
+        # ── LED ──────────────────────────────────────────────
+        led_fill = "#00ff55" if enabled else "#111111"
+        led_out  = "#005500" if enabled else "#222222"
+        cv.create_oval(W-18, 8, W-9, 17, fill=led_fill, outline=led_out)
+
+        # ── Linea separadora superior ────────────────────────
+        cv.create_line(8, 23, W - 8, 23, fill=accent, width=1)
+
+        # ── Perillas (knobs) ─────────────────────────────────
+        knobs = style["knobs"]
+        n_knobs = len(knobs)
+        knob_y = 68
+        KR = 13
+        if n_knobs == 1:
+            xs = [W // 2]
+        elif n_knobs == 2:
+            xs = [W // 3, 2 * W // 3]
+        else:
+            xs = [W // 4, W // 2, 3 * W // 4]
+
+        for xi, lbl in zip(xs, knobs[:3]):
+            cv.create_oval(xi-KR+1, knob_y-KR+1, xi+KR+1, knob_y+KR+1,
+                           fill="#060606", outline="")
+            cv.create_oval(xi-KR, knob_y-KR, xi+KR, knob_y+KR,
+                           fill=kfill, outline=_darken(kfill, 25))
+            # Indicador (linea apuntando a la 1 en punto)
+            ang = -math.pi / 4
+            ix = xi + (KR - 4) * math.sin(ang)
+            iy = knob_y - (KR - 4) * math.cos(ang)
+            cv.create_line(xi, knob_y, int(ix), int(iy),
+                           fill="#cccccc" if enabled else "#444455",
+                           width=2, capstyle="round")
+            # Reflejo pequeño
+            cv.create_oval(xi-KR+3, knob_y-KR+3, xi-KR+8, knob_y-KR+8,
+                           fill=_lighten(kfill, 50) if enabled else "#2a2a3a",
+                           outline="")
+            cv.create_text(xi, knob_y + KR + 8, text=lbl,
+                           fill=txt, font=("Helvetica", 6))
+
+        # ── Nombre del modelo ────────────────────────────────
+        cv.create_text(W // 2, 112, text=style["model"], fill=txt,
+                       font=("Helvetica", 10, "bold"))
+
+        # ── Tipo de efecto ───────────────────────────────────
+        cv.create_text(W // 2, 126, text=pedal.pedal_type.upper(),
+                       fill=_lighten(accent, 60) if enabled else "#444455",
+                       font=("Helvetica", 6), width=W - 10)
+
+        # ── Separador y zona del footswitch ──────────────────
+        cv.create_line(8, H-72, W-8, H-72, fill=accent, width=1)
+        cv.create_rectangle(4, H-70, W-6, H-40, fill=_darken(body, 30), outline=shadow)
+
+        scx, scy, SR = W // 2, H - 55, 14
+        cv.create_oval(scx-SR-1, scy-SR-1, scx+SR+1, scy+SR+1,
+                       fill="#060606", outline="")
+        cv.create_oval(scx-SR, scy-SR, scx+SR, scy+SR,
+                       fill="#1c1c1c", outline="#333333")
+        cv.create_oval(scx-SR+3, scy-SR+3, scx+SR-3, scy+SR-3,
+                       fill="#252525", outline="")
+
+        # ── Goma inferior ────────────────────────────────────
+        cv.create_rectangle(4, H-40, W-6, H-4, fill="#090909", outline="#111111")
+
+        # Clic en el canvas para seleccionar
+        cv.bind("<Button-1>", lambda _, p=pedal: self._select_pedal(p))
+
+        # ── Botones de control debajo del canvas ─────────────
+        btn_row = tk.Frame(outer, bg="#1a1a2e")
+        btn_row.pack(fill="x")
+
+        onoff_bg = "#1b5e20" if enabled else "#7f0000"
+        tk.Button(btn_row, text="ON" if enabled else "OFF",
+                  bg=onoff_bg, fg="white", font=("Helvetica", 7, "bold"),
+                  relief="flat", padx=4, cursor="hand2",
+                  command=lambda p=pedal: self._toggle_pedal(p)
+                  ).pack(side="left", fill="x", expand=True)
 
         if idx > 0:
-            tk.Button(btn_row, text="<", bg="#222233", fg="#aaa", relief="flat",
-                      padx=3, cursor="hand2",
-                      command=lambda p=pedal: self._move_pedal(p, -1)).pack(side="left")
+            tk.Button(btn_row, text="<", bg="#222233", fg="#aaa",
+                      relief="flat", padx=3, cursor="hand2",
+                      command=lambda p=pedal: self._move_pedal(p, -1)
+                      ).pack(side="left")
         if idx < len(self.chain) - 1:
-            tk.Button(btn_row, text=">", bg="#222233", fg="#aaa", relief="flat",
-                      padx=3, cursor="hand2",
-                      command=lambda p=pedal: self._move_pedal(p, 1)).pack(side="left")
+            tk.Button(btn_row, text=">", bg="#222233", fg="#aaa",
+                      relief="flat", padx=3, cursor="hand2",
+                      command=lambda p=pedal: self._move_pedal(p, 1)
+                      ).pack(side="left")
 
-        tk.Button(btn_row, text="X", bg="#7a1a1a", fg="white", relief="flat",
-                  padx=4, cursor="hand2",
-                  command=lambda p=pedal: self._remove_pedal(p)).pack(side="right")
-
-        # Click en el cuerpo para seleccionar
-        def _select(_, p=pedal):
-            self._select_pedal(p)
-
-        box.bind("<Button-1>", _select)
-        # Enlazar solo los labels (no los botones) al click de seleccion
-        for child in box.winfo_children():
-            if isinstance(child, tk.Label):
-                child.bind("<Button-1>", _select)
+        tk.Button(btn_row, text="X", bg="#7a1a1a", fg="white",
+                  relief="flat", padx=4, cursor="hand2",
+                  command=lambda p=pedal: self._remove_pedal(p)
+                  ).pack(side="right")
 
     # ── Editor de parametros ──────────────────────────────────────────────────
 
