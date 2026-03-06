@@ -407,6 +407,114 @@ def _darken(hex_color: str, amount: int = 40) -> str:
     )
 
 
+# ─── Presets ──────────────────────────────────────────────────────────────────
+# Cada preset es una lista de dicts con "type" y "params".
+# Los valores de params deben coincidir exactamente con las keys del PEDALS registry.
+
+PRESETS: Dict[str, List[Dict]] = {
+    "Marty Friedman - Lead": [
+        {   # Gate apretado para silenciar ruido entre frases
+            "type": "Puerta de Ruido",
+            "params": {"threshold_db": -52.0, "ratio": 15.0, "attack_ms": 4.0, "release_ms": 180.0},
+        },
+        {   # Distorsion alta y apretada, estilo Marshall JCM800 con gain alto
+            "type": "Distorsion",
+            "params": {"drive_db": 50.0},
+        },
+        {   # Cortar el barro del bajo — su tono es brillante y articulado
+            "type": "Filtro Agudos",
+            "params": {"cutoff_frequency_hz": 110.0},
+        },
+        {   # Reverb minimo, solo para dar "sala" sin ensuciar
+            "type": "Reverb",
+            "params": {"room_size": 0.2, "damping": 0.75, "wet_level": 0.12, "dry_level": 0.88},
+        },
+    ],
+    "Sonido Limpio": [
+        {
+            "type": "Compresor",
+            "params": {"threshold_db": -18.0, "ratio": 3.0, "attack_ms": 15.0, "release_ms": 120.0},
+        },
+        {
+            "type": "Chorus",
+            "params": {"rate_hz": 0.8, "depth": 0.15, "mix": 0.3},
+        },
+        {
+            "type": "Reverb",
+            "params": {"room_size": 0.4, "damping": 0.5, "wet_level": 0.25, "dry_level": 0.75},
+        },
+    ],
+    "Blues Clasico": [
+        {
+            "type": "Compresor",
+            "params": {"threshold_db": -14.0, "ratio": 4.0, "attack_ms": 8.0, "release_ms": 150.0},
+        },
+        {
+            "type": "Overdrive",
+            "params": {"drive_db": 12.0},
+        },
+        {
+            "type": "Reverb",
+            "params": {"room_size": 0.5, "damping": 0.4, "wet_level": 0.3, "dry_level": 0.7},
+        },
+    ],
+    "Doom / Stoner": [
+        {
+            "type": "Puerta de Ruido",
+            "params": {"threshold_db": -45.0, "ratio": 8.0, "attack_ms": 10.0, "release_ms": 300.0},
+        },
+        {
+            "type": "Distorsion",
+            "params": {"drive_db": 58.0},
+        },
+        {   # Filtro grave para el tono oscuro y pesado
+            "type": "Filtro Graves",
+            "params": {"cutoff_frequency_hz": 3500.0},
+        },
+        {
+            "type": "Reverb",
+            "params": {"room_size": 0.8, "damping": 0.3, "wet_level": 0.4, "dry_level": 0.6},
+        },
+    ],
+    "Surf Rock": [
+        {
+            "type": "Chorus",
+            "params": {"rate_hz": 2.0, "depth": 0.35, "mix": 0.5},
+        },
+        {
+            "type": "Reverb",
+            "params": {"room_size": 0.75, "damping": 0.2, "wet_level": 0.55, "dry_level": 0.45},
+        },
+        {
+            "type": "Delay",
+            "params": {"delay_seconds": 0.18, "feedback": 0.25, "mix": 0.3},
+        },
+    ],
+    "Shred / Metal Moderno": [
+        {
+            "type": "Puerta de Ruido",
+            "params": {"threshold_db": -50.0, "ratio": 20.0, "attack_ms": 3.0, "release_ms": 120.0},
+        },
+        {
+            "type": "Compresor",
+            "params": {"threshold_db": -20.0, "ratio": 6.0, "attack_ms": 5.0, "release_ms": 80.0},
+        },
+        {
+            "type": "Distorsion",
+            "params": {"drive_db": 55.0},
+        },
+        {
+            "type": "Filtro Agudos",
+            "params": {"cutoff_frequency_hz": 90.0},
+        },
+        {
+            "type": "Delay",
+            "params": {"delay_seconds": 0.35, "feedback": 0.2, "mix": 0.2},
+        },
+    ],
+}
+
+
 # ─── Interfaz grafica ─────────────────────────────────────────────────────────
 
 BG         = "#1a1a2e"
@@ -540,6 +648,39 @@ class GuitarPedalboardApp(tk.Tk):
                 command=lambda n=name: self._add_pedal(n),
             )
             btn.pack(fill="x", padx=8, pady=2)
+
+        # ── Seccion de presets ─────────────────────────────
+        tk.Frame(panel, bg="#2a2a4a", height=1).pack(fill="x", padx=10, pady=(12, 8))
+        tk.Label(panel, text="PRESETS", bg=BG_PANEL, fg=FG_DIM,
+                 font=("Helvetica", 8, "bold")).pack()
+
+        self.preset_var = tk.StringVar()
+        preset_combo = ttk.Combobox(panel, textvariable=self.preset_var,
+                                    values=list(PRESETS.keys()),
+                                    state="readonly", width=20)
+        preset_combo.pack(padx=8, pady=(6, 4), fill="x")
+        preset_combo.current(0)
+
+        tk.Button(panel, text="Cargar preset", bg=ACCENT, fg="#000000",
+                  font=FONT_SMALL, relief="flat", pady=5, cursor="hand2",
+                  activebackground=_lighten(ACCENT, 30),
+                  command=self._load_preset).pack(fill="x", padx=8, pady=(0, 8))
+
+    def _load_preset(self):
+        name = self.preset_var.get()
+        if name not in PRESETS:
+            return
+        # Reemplazar la cadena actual con los pedales del preset
+        self.chain.clear()
+        self.selected = None
+        for step in PRESETS[name]:
+            pedal = ActivePedal(step["type"])
+            for key, val in step["params"].items():
+                pedal.set_param(key, val)
+            self.chain.append(pedal)
+        self._rebuild_chain_ui()
+        self._show_editor_placeholder()
+        self._push_chain()
 
     def _build_chain_panel(self, parent):
         self.chain_outer = tk.Frame(parent, bg=BG)
