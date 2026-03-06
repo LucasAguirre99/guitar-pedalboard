@@ -811,7 +811,7 @@ class GuitarPedalboardApp(tk.Tk):
         super().__init__()
         self.title("Guitar Pedalboard")
         self.configure(bg=BG)
-        self.minsize(960, 580)
+        self.minsize(1080, 700)
         self.resizable(True, True)
 
         self.engine = AudioEngine()
@@ -905,15 +905,36 @@ class GuitarPedalboardApp(tk.Tk):
                   command=self._refresh_devices).pack(side="right")
 
     def _build_left_panel(self, parent):
-        panel = tk.Frame(parent, bg=BG_PANEL, width=175)
-        panel.pack(side="left", fill="y")
-        panel.pack_propagate(False)
+        outer = tk.Frame(parent, bg=BG_PANEL, width=195)
+        outer.pack(side="left", fill="y")
+        outer.pack_propagate(False)
+
+        # Canvas scrollable para la lista de pedales
+        lv_canvas = tk.Canvas(outer, bg=BG_PANEL, highlightthickness=0)
+        lv_scroll  = ttk.Scrollbar(outer, orient="vertical", command=lv_canvas.yview)
+        lv_canvas.configure(yscrollcommand=lv_scroll.set)
+        lv_scroll.pack(side="right", fill="y")
+        lv_canvas.pack(side="left", fill="both", expand=True)
+
+        panel = tk.Frame(lv_canvas, bg=BG_PANEL)
+        win_id = lv_canvas.create_window((0, 0), window=panel, anchor="nw")
+
+        def _on_panel_resize(e):
+            lv_canvas.configure(scrollregion=lv_canvas.bbox("all"))
+            lv_canvas.itemconfig(win_id, width=lv_canvas.winfo_width())
+        panel.bind("<Configure>", _on_panel_resize)
+
+        # Scroll con rueda del mouse (Linux: Button-4/5)
+        def _on_wheel(e):
+            lv_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        lv_canvas.bind("<Button-4>", lambda e: lv_canvas.yview_scroll(-1, "units"))
+        lv_canvas.bind("<Button-5>", lambda e: lv_canvas.yview_scroll( 1, "units"))
+        lv_canvas.bind("<MouseWheel>", _on_wheel)
 
         tk.Label(panel, text="PEDALES DISPONIBLES", bg=BG_PANEL, fg=FG_DIM,
                  font=("Helvetica", 8, "bold")).pack(pady=(12, 6))
 
-        sep = tk.Frame(panel, bg="#2a2a4a", height=1)
-        sep.pack(fill="x", padx=10, pady=(0, 8))
+        tk.Frame(panel, bg="#2a2a4a", height=1).pack(fill="x", padx=10, pady=(0, 8))
 
         for name in sorted(PEDALS.keys()):
             color = PEDALS[name]["color"]
@@ -940,7 +961,7 @@ class GuitarPedalboardApp(tk.Tk):
         tk.Button(panel, text="Cargar preset", bg=ACCENT, fg="#000000",
                   font=FONT_SMALL, relief="flat", pady=5, cursor="hand2",
                   activebackground=_lighten(ACCENT, 30),
-                  command=self._load_preset).pack(fill="x", padx=8, pady=(0, 8))
+                  command=self._load_preset).pack(fill="x", padx=8, pady=(0, 12))
 
     def _load_preset(self):
         name = self.preset_var.get()
@@ -1141,6 +1162,9 @@ class GuitarPedalboardApp(tk.Tk):
         self._on_chain_resize()
 
     def _draw_pedal_canvas(self, parent: tk.Widget, pedal: ActivePedal, idx: int):
+        if pedal.pedal_type == "Amplificador":
+            self._draw_amp_canvas(parent, pedal, idx)
+            return
         style   = PEDAL_STYLES[pedal.pedal_type]
         enabled = pedal.enabled
         selected = (pedal is self.selected)
@@ -1241,6 +1265,129 @@ class GuitarPedalboardApp(tk.Tk):
         cv.bind("<Button-1>", lambda _, p=pedal: self._select_pedal(p))
 
         # ── Botones de control debajo del canvas ─────────────
+        btn_row = tk.Frame(outer, bg="#1a1a2e")
+        btn_row.pack(fill="x")
+
+        onoff_bg = "#1b5e20" if enabled else "#7f0000"
+        tk.Button(btn_row, text="ON" if enabled else "OFF",
+                  bg=onoff_bg, fg="white", font=("Helvetica", 7, "bold"),
+                  relief="flat", padx=4, cursor="hand2",
+                  command=lambda p=pedal: self._toggle_pedal(p)
+                  ).pack(side="left", fill="x", expand=True)
+
+        if idx > 0:
+            tk.Button(btn_row, text="<", bg="#222233", fg="#aaa",
+                      relief="flat", padx=3, cursor="hand2",
+                      command=lambda p=pedal: self._move_pedal(p, -1)
+                      ).pack(side="left")
+        if idx < len(self.chain) - 1:
+            tk.Button(btn_row, text=">", bg="#222233", fg="#aaa",
+                      relief="flat", padx=3, cursor="hand2",
+                      command=lambda p=pedal: self._move_pedal(p, 1)
+                      ).pack(side="left")
+
+        tk.Button(btn_row, text="X", bg="#7a1a1a", fg="white",
+                  relief="flat", padx=4, cursor="hand2",
+                  command=lambda p=pedal: self._remove_pedal(p)
+                  ).pack(side="right")
+
+    def _draw_amp_canvas(self, parent: tk.Widget, pedal: ActivePedal, idx: int):
+        """Dibuja la caja del amplificador con estética de amp (cuadrada con grill)."""
+        style    = PEDAL_STYLES["Amplificador"]
+        enabled  = pedal.enabled
+        selected = (pedal is self.selected)
+
+        W, H    = 150, 162
+        body    = style["body"]   if enabled else "#1a1a1a"
+        accent  = style["accent"] if enabled else "#111111"
+        chrome  = "#8a8a8a"       if enabled else "#444444"
+        grill_bg   = "#140e00"    if enabled else "#0e0e0e"
+        grill_line = "#221800"    if enabled else "#161616"
+        kfill   = style["knob_color"] if enabled else "#333333"
+        txt     = "#d8d8d8"       if enabled else "#505050"
+
+        # Nombre del modelo actual (dinámico según param)
+        model_idx  = int(round(pedal.params.get("model_idx", 0.0))) % len(_AMP_MODELS)
+        model_name = _AMP_MODELS[model_idx]
+
+        border_color = "#ffffff" if selected else "#1a1a2e"
+        outer = tk.Frame(parent, bg=border_color, padx=2, pady=2)
+        outer.pack(side="left", padx=3, pady=8)
+
+        cv = tk.Canvas(outer, width=W, height=H, bg="#080808",
+                       highlightthickness=0, cursor="hand2")
+        cv.pack()
+
+        # ── Cuerpo principal ──────────────────────────────────────────────
+        cv.create_rectangle(3, 3, W-3, H-3, fill=body, outline=accent, width=2)
+
+        # ── Marco tipo chasis de metal ────────────────────────────────────
+        cv.create_line(3,   3, W-3,   3, fill=chrome, width=2)   # top
+        cv.create_line(3,   3,   3, H-3, fill=chrome, width=2)   # left
+        cv.create_line(W-3, 3, W-3, H-3, fill=_darken(chrome, 35), width=2)  # right
+        cv.create_line(3, H-3, W-3, H-3, fill=_darken(chrome, 35), width=2)  # bottom
+
+        # ── Panel de control (franja superior) ────────────────────────────
+        ctrl_h = 60
+        cv.create_rectangle(5, 5, W-5, ctrl_h, fill=_lighten(body, 18), outline="")
+
+        # Brand
+        cv.create_text(12, 14, text=style["brand"], fill=txt,
+                       font=("Helvetica", 7, "bold"), anchor="w")
+        # Modelo (dinámico)
+        cv.create_text(W // 2, 14, text=model_name, fill=_lighten(accent, 80) if enabled else "#444444",
+                       font=("Helvetica", 6), anchor="center")
+
+        # LED
+        led_fill = "#00ff55" if enabled else "#111111"
+        cv.create_oval(W-17, 8, W-8, 17,
+                       fill=led_fill, outline="#005500" if enabled else "#222222")
+
+        # ── Tres perillas en el panel de control ──────────────────────────
+        knobs = style["knobs"][:3]
+        KR, knob_y = 10, 44
+        xs = [W // 4, W // 2, 3 * W // 4]
+        for xi, lbl in zip(xs, knobs):
+            cv.create_oval(xi-KR+1, knob_y-KR+1, xi+KR+1, knob_y+KR+1, fill="#040404", outline="")
+            cv.create_oval(xi-KR,   knob_y-KR,   xi+KR,   knob_y+KR,
+                           fill=kfill, outline=_darken(kfill, 25))
+            ang = -math.pi / 4
+            ix  = xi + (KR - 3) * math.sin(ang)
+            iy  = knob_y - (KR - 3) * math.cos(ang)
+            cv.create_line(xi, knob_y, int(ix), int(iy),
+                           fill="#cccccc" if enabled else "#444455",
+                           width=2, capstyle="round")
+            cv.create_text(xi, knob_y + KR + 5, text=lbl,
+                           fill=txt, font=("Helvetica", 5))
+
+        # ── Separador panel / grill ───────────────────────────────────────
+        cv.create_line(5, ctrl_h + 1, W-5, ctrl_h + 1, fill=chrome, width=2)
+
+        # ── Speaker grill ─────────────────────────────────────────────────
+        gx1, gy1 = 7,    ctrl_h + 5
+        gx2, gy2 = W-7,  H - 7
+        cv.create_rectangle(gx1, gy1, gx2, gy2, fill=grill_bg, outline="")
+
+        # Líneas horizontales de grill cloth
+        for y in range(gy1 + 3, gy2 - 1, 4):
+            cv.create_line(gx1 + 2, y, gx2 - 2, y, fill=grill_line, width=2)
+
+        # ── Cono del altavoz (círculo central) ────────────────────────────
+        cx  = (gx1 + gx2) // 2
+        cy  = (gy1 + gy2) // 2
+        SR  = min((gx2 - gx1) // 2, (gy2 - gy1) // 2) - 4
+        sp_ring = _darken(grill_line, 5) if enabled else "#101010"
+        cv.create_oval(cx-SR,   cy-SR,   cx+SR,   cy+SR,
+                       fill=_darken(grill_bg, 8), outline=_lighten(grill_line, 12), width=1)
+        cv.create_oval(cx-SR+7, cy-SR+7, cx+SR-7, cy+SR-7,
+                       fill=grill_bg, outline=grill_line, width=1)
+        cv.create_oval(cx-5,    cy-5,    cx+5,    cy+5,
+                       fill=grill_line, outline="")
+
+        # Clic para seleccionar
+        cv.bind("<Button-1>", lambda _, p=pedal: self._select_pedal(p))
+
+        # ── Botones de control ────────────────────────────────────────────
         btn_row = tk.Frame(outer, bg="#1a1a2e")
         btn_row.pack(fill="x")
 
