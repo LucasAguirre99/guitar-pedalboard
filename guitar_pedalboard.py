@@ -791,6 +791,355 @@ PRESETS: Dict[str, List[Dict]] = {
 }
 
 
+# ─── Círculo de Quintas + Escalas + Base ─────────────────────────────────────
+
+ROOT_NOTES   = ['C', 'C#', 'D', 'Eb', 'E', 'F', 'F#', 'G', 'Ab', 'A', 'Bb', 'B']
+
+NOTE_TO_SEMI: Dict[str, int] = {
+    'C': 0, 'C#': 1, 'Db': 1, 'D': 2, 'D#': 3, 'Eb': 3,
+    'E': 4, 'F': 5, 'F#': 6, 'Gb': 6, 'G': 7, 'G#': 8,
+    'Ab': 8, 'A': 9, 'A#': 10, 'Bb': 10, 'B': 11,
+}
+
+CIRCLE_NOTES = ['C',  'G',  'D', 'A',  'E',  'B',  'F#', 'Db', 'Ab', 'Eb', 'Bb', 'F']
+CIRCLE_SEMIS = [0,     7,    2,   9,    4,    11,   6,    1,    8,    3,    10,   5  ]
+CIRCLE_MINOR = ['Am', 'Em', 'Bm', 'F#m', 'C#m', 'G#m', 'Ebm', 'Bbm', 'Fm', 'Cm', 'Gm', 'Dm']
+
+SCALES_COF: Dict[str, List[int]] = {
+    "Mayor":             [0, 2, 4, 5, 7, 9, 11],
+    "Menor Natural":     [0, 2, 3, 5, 7, 8, 10],
+    "Pentatónica Mayor": [0, 2, 4, 7, 9],
+    "Pentatónica Menor": [0, 3, 5, 7, 10],
+    "Blues":             [0, 3, 5, 6, 7, 10],
+    "Dorian":            [0, 2, 3, 5, 7, 9, 10],
+    "Frigio":            [0, 1, 3, 5, 7, 8, 10],
+    "Lidio":             [0, 2, 4, 6, 7, 9, 11],
+    "Mixolidio":         [0, 2, 4, 5, 7, 9, 10],
+    "Menor Armónica":    [0, 2, 3, 5, 7, 8, 11],
+}
+
+# ── Síntesis de audio para la base ────────────────────────────────────────────
+
+_BT_SR = 44100
+
+
+def _synth_chord(freqs: list, duration: float, amplitude: float = 0.16) -> np.ndarray:
+    """Sintetiza un acorde: senos con armónicos + arpegio leve + envolvente ADSR."""
+    n   = int(duration * _BT_SR)
+    t   = np.linspace(0, duration, n, endpoint=False, dtype=np.float64)
+    out = np.zeros(n, dtype=np.float64)
+    for fi, freq in enumerate(freqs):
+        stagger = int(fi * 0.011 * _BT_SR)          # arpegio: 11 ms entre cuerdas
+        wave    = (np.sin(2*np.pi * freq     * t) * 0.55 +
+                   np.sin(2*np.pi * freq * 2 * t) * 0.22 +
+                   np.sin(2*np.pi * freq * 3 * t) * 0.12 +
+                   np.sin(2*np.pi * freq * 4 * t) * 0.06 +
+                   np.sin(2*np.pi * freq * 0.5*t) * 0.05)
+        if stagger < n:
+            out[stagger:] += wave[:n - stagger]
+    atk = min(int(0.015 * _BT_SR), n // 8)
+    dec = min(int(0.08  * _BT_SR), n // 4)
+    rel = min(int(0.40  * _BT_SR), n // 3)
+    env = np.ones(n, dtype=np.float64)
+    env[:atk]        = np.linspace(0.0, 1.0, atk)
+    env[atk:atk+dec] = np.linspace(1.0, 0.75, dec)
+    if rel < n:
+        env[-rel:] *= np.linspace(1.0, 0.0, rel)
+    return (out * env * amplitude / max(len(freqs), 1)).astype(np.float32)
+
+
+def _build_chord_freqs(scale_semis: list, degree: int, octave: int = 4) -> list:
+    """Construye frecuencias de una tríada diatónica en la posición dada."""
+    n       = len(scale_semis)
+    r_semi  = scale_semis[degree % n]
+    t_semi  = scale_semis[(degree + 2) % n]
+    f_semi  = scale_semis[(degree + 4) % n]
+    def s2f(semi, oct_):
+        midi = semi + 12 * (oct_ + 1)
+        return 440.0 * (2 ** ((midi - 69) / 12.0))
+    r_f = s2f(r_semi, octave)
+    t_f = s2f(t_semi, octave); t_f = t_f * 2 if t_f <= r_f else t_f
+    f_f = s2f(f_semi, octave); f_f = f_f * 2 if f_f <= r_f else f_f
+    bass = r_f / 4.0           # bajo 2 octavas abajo
+    return [bass, r_f, t_f, f_f]
+
+
+def generate_backing_track(root_note: str, scale_name: str, bpm: int = 80) -> np.ndarray:
+    """Genera un loop de 4 compases de acordes diatónicos sintetizados."""
+    chord_dur   = (60.0 / max(40, bpm)) * 4   # 1 compás por acorde (4/4)
+    root_semi   = NOTE_TO_SEMI.get(root_note, 0)
+    intervals   = SCALES_COF.get(scale_name, SCALES_COF["Mayor"])
+    scale_semis = [(root_semi + iv) % 12 for iv in intervals]
+    n_sc        = len(intervals)
+    # Progresión de acordes por tipo de escala
+    if "Menor" in scale_name or scale_name in ("Blues", "Dorian", "Frigio"):
+        prog = [0, 5 % n_sc, 6 % n_sc, 0]
+    else:
+        prog = [0, 3 % n_sc, 4 % n_sc, 0]
+    bars = [_synth_chord(_build_chord_freqs(scale_semis, d), chord_dur) for d in prog]
+    return np.concatenate(bars)
+
+
+class BackingTrackPlayer:
+    """
+    Reproduce en loop una base sintetizada via sd.OutputStream con callback.
+    Completamente independiente del sd.Stream del motor de guitarra —
+    evita colisiones en PortAudio que causaban el crash 'double free'.
+    """
+
+    def __init__(self):
+        self._audio:  Optional[np.ndarray] = None   # (N, 2) float32 stereo
+        self._pos    = 0
+        self._stream: Optional[sd.OutputStream] = None
+
+    def load(self, root: str, scale: str, bpm: int):
+        mono = generate_backing_track(root, scale, bpm)
+        # Contiguous stereo array (N, 2) — requerido por OutputStream
+        self._audio = np.ascontiguousarray(
+            np.stack([mono, mono], axis=1), dtype=np.float32
+        )
+
+    def start(self):
+        self.stop()
+        if self._audio is None:
+            return
+        self._pos = 0
+        try:
+            self._stream = sd.OutputStream(
+                samplerate=_BT_SR,
+                channels=2,
+                dtype='float32',
+                callback=self._callback,
+                latency='low',
+            )
+            self._stream.start()
+        except Exception as exc:
+            print(f"BackingTrackPlayer error: {exc}")
+            self._stream = None
+
+    def stop(self):
+        if self._stream is not None:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
+
+    def _callback(self, outdata: np.ndarray, frames: int, time_info, status):
+        """Llena outdata con audio en loop. Llamado desde hilo interno de PortAudio."""
+        audio = self._audio
+        if audio is None:
+            outdata[:] = 0
+            return
+        n, pos = len(audio), self._pos
+        end = pos + frames
+        if end <= n:
+            outdata[:] = audio[pos:end]
+            self._pos  = end % n        # vuelve a 0 al llegar al final
+        else:
+            first = n - pos
+            outdata[:first] = audio[pos:]
+            remaining       = frames - first
+            outdata[first:] = audio[:remaining]
+            self._pos       = remaining
+
+
+# ── Ventana: Círculo de Quintas ───────────────────────────────────────────────
+
+class CircleOfFifthsWindow(tk.Toplevel):
+    _CW, _CH = 460, 460    # tamaño del canvas
+    _CX, _CY = 230, 230    # centro
+    _R_OUT   = 205          # radio exterior
+    _R_MID   = 140          # radio entre anillos
+    _R_IN    = 82           # radio interior (hueco central)
+
+    def __init__(self, master):
+        super().__init__(master)
+        self.title("Círculo de Quintas")
+        self.configure(bg="#1a1a2e")
+        self.resizable(False, False)
+        self._player  = BackingTrackPlayer()
+        self._playing = False
+        self._root_var  = tk.StringVar(value="C")
+        self._scale_var = tk.StringVar(value="Mayor")
+        self._bpm_var   = tk.StringVar(value="80")
+        self._build_ui()
+        self._update_display()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _build_ui(self):
+        BG_, FG_, FG_DIM_, ACCENT_ = "#1a1a2e", "#e0e0e0", "#888888", "#00b4d8"
+        FONT_  = ("Helvetica", 10)
+        FONTB_ = ("Helvetica", 10, "bold")
+        FONTS_ = ("Helvetica", 8)
+
+        tk.Label(self, text="CÍRCULO DE QUINTAS", bg=BG_, fg=ACCENT_,
+                 font=("Helvetica", 13, "bold")).pack(pady=(14, 4))
+
+        self._cv = tk.Canvas(self, bg=BG_, width=self._CW, height=self._CH,
+                              highlightthickness=0)
+        self._cv.pack(padx=20)
+        self._cv.bind("<Button-1>", self._on_circle_click)
+
+        ctrl = tk.Frame(self, bg=BG_, pady=6)
+        ctrl.pack(fill="x", padx=24)
+
+        # Fila 1: nota raíz + escala
+        row1 = tk.Frame(ctrl, bg=BG_)
+        row1.pack(fill="x", pady=(0, 6))
+        tk.Label(row1, text="Nota raíz:", bg=BG_, fg=FG_, font=FONT_).pack(side="left")
+        root_cb = ttk.Combobox(row1, textvariable=self._root_var,
+                                values=ROOT_NOTES, state="readonly", width=5)
+        root_cb.pack(side="left", padx=(5, 18))
+        root_cb.bind("<<ComboboxSelected>>", lambda e: self._update_display())
+
+        tk.Label(row1, text="Escala:", bg=BG_, fg=FG_, font=FONT_).pack(side="left")
+        scale_cb = ttk.Combobox(row1, textvariable=self._scale_var,
+                                 values=list(SCALES_COF.keys()), state="readonly", width=20)
+        scale_cb.pack(side="left", padx=(5, 0))
+        scale_cb.bind("<<ComboboxSelected>>", lambda e: self._update_display())
+
+        # Notas de la escala
+        self._notes_lbl = tk.Label(ctrl, text="Notas: —", bg=BG_, fg=ACCENT_,
+                                    font=FONTB_, anchor="w")
+        self._notes_lbl.pack(fill="x", pady=(0, 8))
+
+        tk.Frame(ctrl, bg="#2a2a4a", height=1).pack(fill="x", pady=(0, 8))
+
+        # Fila 2: BPM + botón reproducir
+        row2 = tk.Frame(ctrl, bg=BG_)
+        row2.pack(fill="x")
+        tk.Label(row2, text="BPM:", bg=BG_, fg=FG_, font=FONT_).pack(side="left")
+        ttk.Combobox(row2, textvariable=self._bpm_var,
+                     values=["50","60","70","80","90","100","110","120","140"],
+                     width=5).pack(side="left", padx=(5, 20))
+        self._play_btn = tk.Button(
+            row2, text="▶   Reproducir base",
+            bg="#2e7d32", fg="white", font=FONTB_,
+            relief="flat", padx=14, pady=5, cursor="hand2",
+            activebackground="#1b5e20", activeforeground="white",
+            command=self._toggle_play,
+        )
+        self._play_btn.pack(side="left")
+        self._status_lbl = tk.Label(ctrl, text="", bg=BG_, fg=FG_DIM_, font=FONTS_)
+        self._status_lbl.pack(anchor="w", pady=(6, 4))
+
+    # ── Lógica de escala ──────────────────────────────────────────────────────
+
+    def _get_scale_semis(self) -> list:
+        root_semi = NOTE_TO_SEMI.get(self._root_var.get(), 0)
+        return [(root_semi + iv) % 12 for iv in SCALES_COF.get(self._scale_var.get(), [])]
+
+    def _update_display(self):
+        semis      = self._get_scale_semis()
+        note_names = [NOTE_NAMES[s] for s in semis]
+        self._notes_lbl.config(text="Notas: " + "   ".join(note_names))
+        self._draw_circle(semis)
+        if self._playing:
+            self._reload_and_play()
+
+    # ── Dibujo del círculo ────────────────────────────────────────────────────
+
+    def _draw_circle(self, highlighted: list):
+        c  = self._cv
+        cx, cy = self._CX, self._CY
+        Ro, Rm, Ri = self._R_OUT, self._R_MID, self._R_IN
+        root_semi = NOTE_TO_SEMI.get(self._root_var.get(), 0)
+        c.delete("all")
+
+        # Fondo
+        c.create_oval(cx-Ro-6, cy-Ro-6, cx+Ro+6, cy+Ro+6,
+                       fill="#0d1117", outline="#1e2a3a", width=2)
+
+        # ── Anillo exterior: notas mayores ────────────────────────────────
+        for i, (note, semi) in enumerate(zip(CIRCLE_NOTES, CIRCLE_SEMIS)):
+            is_root  = (semi == root_semi)
+            in_scale = (semi in highlighted)
+            angle    = -90 + i * 30
+            fill = "#c0392b" if is_root else ("#1a5e3a" if in_scale else "#1a2233")
+            c.create_arc(cx-Ro, cy-Ro, cx+Ro, cy+Ro,
+                          start=angle, extent=28,
+                          fill=fill, outline="#0d1117", width=2, style=tk.PIESLICE)
+            ang_rad  = math.radians(angle + 14)
+            r_text   = (Ro + Rm) / 2
+            lx = cx + r_text * math.cos(ang_rad)
+            ly = cy + r_text * math.sin(ang_rad)
+            color = "#ffffff" if (in_scale or is_root) else "#3a5060"
+            c.create_text(lx, ly, text=note,
+                           fill=color, font=("Helvetica", 12, "bold"))
+
+        # Hueco entre anillos
+        c.create_oval(cx-Rm, cy-Rm, cx+Rm, cy+Rm, fill="#0d1117", outline="#0d1117")
+
+        # ── Anillo interior: relativas menores ────────────────────────────
+        for i, (minor, major_semi) in enumerate(zip(CIRCLE_MINOR, CIRCLE_SEMIS)):
+            m_semi   = (major_semi + 9) % 12
+            in_scale = (m_semi in highlighted)
+            angle    = -90 + i * 30
+            fill = "#2a3a2a" if in_scale else "#111a22"
+            c.create_arc(cx-Rm+2, cy-Rm+2, cx+Rm-2, cy+Rm-2,
+                          start=angle, extent=28,
+                          fill=fill, outline="#0d1117", width=1, style=tk.PIESLICE)
+            ang_rad = math.radians(angle + 14)
+            r_text  = (Rm + Ri) / 2
+            lx = cx + r_text * math.cos(ang_rad)
+            ly = cy + r_text * math.sin(ang_rad)
+            color = "#88cc88" if in_scale else "#334455"
+            c.create_text(lx, ly, text=minor, fill=color, font=("Helvetica", 9))
+
+        # ── Centro ────────────────────────────────────────────────────────
+        c.create_oval(cx-Ri, cy-Ri, cx+Ri, cy+Ri, fill="#0d1b2a", outline="#1e2a3a", width=2)
+        c.create_text(cx, cy - 14, text=self._root_var.get(),
+                       fill="#00b4d8", font=("Helvetica", 26, "bold"))
+        c.create_text(cx, cy + 17, text=self._scale_var.get(),
+                       fill="#888888", font=("Helvetica", 9))
+
+    def _on_circle_click(self, event):
+        """Clic en el anillo exterior selecciona la nota raíz."""
+        dx, dy = event.x - self._CX, event.y - self._CY
+        dist   = math.hypot(dx, dy)
+        if dist < self._R_MID or dist > self._R_OUT:
+            return
+        angle = (math.degrees(math.atan2(dy, dx)) + 90) % 360
+        note  = CIRCLE_NOTES[int(angle / 30) % 12]
+        self._root_var.set(note)
+        self._update_display()
+
+    # ── Reproducción de base ──────────────────────────────────────────────────
+
+    def _reload_and_play(self):
+        root, scale = self._root_var.get(), self._scale_var.get()
+        try:   bpm = int(self._bpm_var.get())
+        except: bpm = 80
+        self._status_lbl.config(text="Generando base…")
+        self.after(20, lambda: self._do_reload(root, scale, bpm))
+
+    def _do_reload(self, root, scale, bpm):
+        self._player.stop()
+        self._player.load(root, scale, bpm)
+        if self._playing:
+            self._player.start()
+        self._status_lbl.config(text="")
+
+    def _toggle_play(self):
+        if self._playing:
+            self._player.stop()
+            self._playing = False
+            self._play_btn.config(text="▶   Reproducir base", bg="#2e7d32",
+                                   activebackground="#1b5e20")
+            self._status_lbl.config(text="")
+        else:
+            self._playing = True
+            self._play_btn.config(text="⏹   Detener base", bg="#c62828",
+                                   activebackground="#b71c1c")
+            self._reload_and_play()
+
+    def _on_close(self):
+        self._player.stop()
+        self.destroy()
+
+
 # ─── Interfaz grafica ─────────────────────────────────────────────────────────
 
 BG         = "#1a1a2e"
@@ -854,6 +1203,9 @@ class GuitarPedalboardApp(tk.Tk):
         self._build_left_panel(main)
         self._build_chain_panel(main)
         self._build_editor_panel(main)
+
+        # Barra inferior con herramientas adicionales
+        self._build_bottom_bar()
 
     def _build_topbar(self):
         bar = tk.Frame(self, bg=BG_DARK, pady=8, padx=14)
@@ -1640,6 +1992,23 @@ class GuitarPedalboardApp(tk.Tk):
             self._draw_tuner_bar(cents)
 
         self.after(120, self._update_tuner)
+
+    # ── Barra inferior ────────────────────────────────────────────────────────
+
+    def _build_bottom_bar(self):
+        bar = tk.Frame(self, bg=BG_DARK, pady=8, padx=14)
+        bar.pack(fill="x", side="bottom")
+        tk.Button(
+            bar, text="🎵  Círculo de Quintas / Escalas / Base",
+            bg="#0d2233", fg=ACCENT, font=FONT_BOLD,
+            relief="flat", padx=14, pady=4, cursor="hand2",
+            activebackground="#1a3a55", activeforeground=ACCENT,
+            command=self._open_circle_of_fifths,
+        ).pack(side="left")
+
+    def _open_circle_of_fifths(self):
+        win = CircleOfFifthsWindow(self)
+        win.focus_set()
 
     # ── Cierre ────────────────────────────────────────────────────────────────
 
