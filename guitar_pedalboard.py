@@ -27,6 +27,83 @@ except ImportError as e:
     DEPS_OK = False
     MISSING_MSG = str(e)
 
+# ─── Wah: filtro biquad resonante con LFO opcional ───────────────────────────
+
+class WahProcessor:
+    """
+    Wah: peaking EQ biquad cuya frecuencia central varía en tiempo real.
+    - Manual: el slider 'Posición' fija la frecuencia (300–2200 Hz).
+    - Auto:   un LFO senoidal barre la frecuencia automáticamente.
+    Compatible con el sistema de segmentos del AudioEngine (protocolo __call__).
+    """
+
+    _FREQ_MIN = 300.0
+    _FREQ_MAX = 2200.0
+
+    def __init__(self):
+        self.cutoff_hz  = 800.0
+        self.resonance  = 5.0
+        self.mix        = 0.9
+        self.rate_hz    = 1.5
+        self.depth      = 0.8
+        self._auto      = False
+        self._lfo_phase = 0.0
+        self._z1        = 0.0
+        self._z2        = 0.0
+
+    # Propiedad para mapear float 0/1 → bool (usado por set_param via setattr)
+    @property
+    def auto_mode(self) -> float:
+        return 1.0 if self._auto else 0.0
+
+    @auto_mode.setter
+    def auto_mode(self, value: float):
+        self._auto = bool(round(float(value)))
+
+    def _coeffs(self, freq: float, sr: int):
+        """Coeficientes biquad peaking EQ (Audio EQ Cookbook)."""
+        f     = max(20.0, min(float(sr) * 0.49, freq))
+        w0    = 2.0 * math.pi * f / sr
+        Q     = max(0.5, self.resonance)
+        A     = 3.981           # ~12 dB de ganancia en el pico
+        alpha = math.sin(w0) / (2.0 * Q)
+        c     = math.cos(w0)
+        b0, b1, b2 =  1 + alpha * A, -2 * c,  1 - alpha * A
+        a0, a1, a2 =  1 + alpha / A, -2 * c,  1 - alpha / A
+        return b0/a0, b1/a0, b2/a0, a1/a0, a2/a0
+
+    def __call__(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
+        """Procesa audio mono float32 1D. Devuelve float32 1D."""
+        if self._auto:
+            lfo    = math.sin(2.0 * math.pi * self._lfo_phase)
+            center = (self._FREQ_MIN + self._FREQ_MAX) / 2.0
+            half   = (self._FREQ_MAX - self._FREQ_MIN) / 2.0 * self.depth
+            freq   = max(self._FREQ_MIN, min(self._FREQ_MAX, center + lfo * half))
+            self._lfo_phase = (self._lfo_phase + self.rate_hz * len(audio) / sample_rate) % 1.0
+        else:
+            freq = max(self._FREQ_MIN, min(self._FREQ_MAX, self.cutoff_hz))
+
+        b0, b1, b2, a1, a2 = self._coeffs(freq, sample_rate)
+        mix      = self.mix
+        z1, z2   = self._z1, self._z2
+        out      = np.empty(len(audio), dtype=np.float32)
+        for i in range(len(audio)):
+            x      = float(audio[i])
+            y      = b0 * x + z1
+            z1     = b1 * x - a1 * y + z2
+            z2     = b2 * x - a2 * y
+            out[i] = x * (1.0 - mix) + y * mix
+        self._z1, self._z2 = z1, z2
+        return out
+
+
+def _make_wah(params: dict) -> WahProcessor:
+    w = WahProcessor()
+    for k, v in params.items():
+        setattr(w, k, v)
+    return w
+
+
 # ─── Definicion de pedales disponibles ───────────────────────────────────────
 #  "params" define cada control: su nombre en el plugin, label, rango y default.
 PEDALS: Dict[str, Any] = {
@@ -156,6 +233,28 @@ PEDALS: Dict[str, Any] = {
             "semitones": {"label": "Semitonos", "min": -12.0, "max": 12.0, "default": 0.0, "unit": " st"},
         },
     },
+    "Wah": {
+        "factory": _make_wah,
+        "custom": True,          # No es un plugin de pedalboard — se procesa aparte
+        "color": "#c8860a",
+        "params": {
+            "cutoff_hz": {
+                "label": "Posición", "min": 300.0, "max": 2200.0, "default": 800.0, "unit": " Hz",
+                "visible_when": lambda p: round(p.get("auto_mode", 0.0)) == 0,
+            },
+            "resonance": {"label": "Resonancia", "min": 2.0, "max": 12.0, "default": 5.0, "unit": ""},
+            "mix":       {"label": "Mezcla",     "min": 0.0, "max": 1.0,  "default": 0.9, "unit": ""},
+            "rate_hz": {
+                "label": "Vel. LFO", "min": 0.1, "max": 8.0, "default": 1.5, "unit": " Hz",
+                "visible_when": lambda p: round(p.get("auto_mode", 0.0)) == 1,
+            },
+            "depth": {
+                "label": "Profundidad", "min": 0.0, "max": 1.0, "default": 0.8, "unit": "",
+                "visible_when": lambda p: round(p.get("auto_mode", 0.0)) == 1,
+            },
+            "auto_mode": {"label": "Modo", "min": 0.0, "max": 1.0, "default": 0.0, "unit": "", "toggle": True},
+        },
+    },
 }
 
 
@@ -263,7 +362,7 @@ class AudioEngine:
 
     def __init__(self):
         self._stream: Optional[sd.Stream] = None
-        self._pedalboard = Pedalboard([])
+        self._segments: list = []   # lista de Pedalboard o WahProcessor
         self._lock = threading.Lock()
         self._ready_event = threading.Event()
         self.running = False
@@ -293,7 +392,7 @@ class AudioEngine:
                   frames: int, time_info, status):
         """Callback de sounddevice: procesa cada buffer en tiempo real."""
         with self._lock:
-            pb = self._pedalboard
+            segments = self._segments
         # indata: (frames, 2) float32 — mezclar a mono y procesar
         mono = indata.mean(axis=1, keepdims=True).T  # (1, frames)
 
@@ -311,9 +410,15 @@ class AudioEngine:
             self._tuner_buf[self._tuner_pos:self._tuner_pos + n] = raw
             self._tuner_pos += n
 
-        processed = pb(mono, self._sample_rate, reset=False)
-        if processed.shape[0] == 1:
-            processed = np.repeat(processed, 2, axis=0)
+        # Procesar a través de la cadena de segmentos (Pedalboard o WahProcessor)
+        audio = mono[0]  # (frames,) float32
+        for seg in segments:
+            if isinstance(seg, Pedalboard):
+                audio = seg(audio.reshape(1, -1), self._sample_rate, reset=False)[0]
+            else:
+                audio = seg(audio, self._sample_rate)
+
+        processed = np.repeat(audio.reshape(1, -1), 2, axis=0)
         outdata[:] = processed.T[:frames]
 
     def start(self, input_name: str, output_name: str,
@@ -365,10 +470,27 @@ class AudioEngine:
         self.running = False
 
     def update_chain(self, chain: List["ActivePedal"]):
-        """Actualiza la cadena de efectos activa (thread-safe)."""
-        plugins = [p.get_plugin() for p in chain if p.enabled]
+        """
+        Construye segmentos de procesamiento (thread-safe).
+        Los plugins de pedalboard se agrupan en Pedalboard consecutivos.
+        Los WahProcessor se insertan como segmentos individuales (orden preservado).
+        """
+        segments: list = []
+        pb_buf: list = []
+        for p in chain:
+            if not p.enabled:
+                continue
+            if PEDALS[p.pedal_type].get("custom"):
+                if pb_buf:
+                    segments.append(Pedalboard(pb_buf[:]))
+                    pb_buf = []
+                segments.append(p.get_plugin())
+            else:
+                pb_buf.append(p.get_plugin())
+        if pb_buf:
+            segments.append(Pedalboard(pb_buf))
         with self._lock:
-            self._pedalboard = Pedalboard(plugins)
+            self._segments = segments
 
 
 # ─── Estilos visuales de pedales (inspirados en modelos famosos) ─────────────
@@ -386,6 +508,7 @@ PEDAL_STYLES: Dict[str, Any] = {
     "Filtro Agudos":   {"brand": "EHX",    "model": "Knockout",  "body": "#880e4f", "accent": "#560027", "knob_color": "#111111", "knobs": ["FREQ"]},
     "Filtro Graves":   {"brand": "EHX",    "model": "Bass Boost","body": "#1b5e20", "accent": "#003300", "knob_color": "#111111", "knobs": ["FREQ"]},
     "Pitch Shift":     {"brand": "BOSS",   "model": "PS-6",      "body": "#6a1b9a", "accent": "#4a0072", "knob_color": "#111111", "knobs": ["PITCH", "MODE"]},
+    "Wah":             {"brand": "DUNLOP", "model": "Cry Baby",  "body": "#c8860a", "accent": "#8a5e00", "knob_color": "#1a1a1a", "knobs": ["Q", "VOL"]},
 }
 
 
@@ -1004,13 +1127,38 @@ class GuitarPedalboardApp(tk.Tk):
         tk.Label(self.editor_scroll_frame, text=pedal.pedal_type,
                  bg=BG_PANEL, fg=color, font=("Helvetica", 12, "bold")).pack(pady=(0, 10))
 
-        # Un slider por parametro
+        # Un control por parametro
         for key, meta in defn["params"].items():
-            # Seccion del parametro
+            # Visibilidad condicional (usado por el Wah para ocultar params segun modo)
+            visible_when = meta.get("visible_when")
+            if visible_when is not None and not visible_when(pedal.params):
+                continue
+
             sect = tk.Frame(self.editor_scroll_frame, bg=BG_PANEL)
             sect.pack(fill="x", pady=5)
 
-            # Label + valor actual
+            # ── Toggle (ej. Auto/Manual del Wah) ──────────────────────────
+            if meta.get("toggle"):
+                is_on = round(pedal.params[key]) == 1
+                lbl_text = meta["label"]
+                btn_text = f"{lbl_text}: AUTO" if is_on else f"{lbl_text}: MANUAL"
+                btn_color = ACCENT if is_on else "#333355"
+
+                def _make_toggle(k=key, p=pedal):
+                    def _toggle():
+                        new_val = 1.0 - round(p.params[k])
+                        p.set_param(k, new_val)
+                        self._push_chain()
+                        self._build_editor(p)
+                    return _toggle
+
+                tk.Button(sect, text=btn_text, bg=btn_color, fg="white" if not is_on else "#000000",
+                          font=FONT_BOLD, relief="flat", pady=6, cursor="hand2",
+                          activebackground=_lighten(btn_color, 20),
+                          command=_make_toggle()).pack(fill="x")
+                continue
+
+            # ── Slider normal ─────────────────────────────────────────────
             header = tk.Frame(sect, bg=BG_PANEL)
             header.pack(fill="x")
 
@@ -1023,7 +1171,6 @@ class GuitarPedalboardApp(tk.Tk):
                                 bg=BG_PANEL, fg=color, font=FONT_SMALL, width=10, anchor="e")
             val_lbl.pack(side="right")
 
-            # Slider
             def _make_cb(k=key, v=var, lbl=val_lbl, u=meta["unit"], p=pedal):
                 def _cb(value):
                     val = float(value)
