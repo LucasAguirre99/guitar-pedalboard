@@ -104,6 +104,140 @@ def _make_wah(params: dict) -> WahProcessor:
     return w
 
 
+# ─── Amplificador: simulación de amp con saturación y EQ ─────────────────────
+
+def _biquad_apply(audio: np.ndarray, b0, b1, b2, a1, a2, state: list) -> np.ndarray:
+    """Aplica un filtro biquad IIR (Direct Form II Transposed). state = [z1, z2]."""
+    z1, z2 = state[0], state[1]
+    out = np.empty(len(audio), dtype=np.float32)
+    for i in range(len(audio)):
+        x = float(audio[i])
+        y = b0 * x + z1
+        z1 = b1 * x - a1 * y + z2
+        z2 = b2 * x - a2 * y
+        out[i] = y
+    state[0], state[1] = z1, z2
+    return out
+
+
+def _coeffs_low_shelf(freq: float, gain_db: float, sr: int):
+    A     = 10 ** (gain_db / 40.0)
+    w0    = 2.0 * math.pi * max(1.0, freq) / sr
+    alpha = math.sin(w0) / 2.0 * math.sqrt(2.0)
+    c, sq = math.cos(w0), 2.0 * math.sqrt(A) * alpha
+    b0 =  A * ((A+1) - (A-1)*c + sq);  b1 = 2*A * ((A-1) - (A+1)*c);  b2 = A * ((A+1) - (A-1)*c - sq)
+    a0 =      (A+1) + (A-1)*c + sq;    a1 = -2  * ((A-1) + (A+1)*c);  a2 =     (A+1) + (A-1)*c - sq
+    return b0/a0, b1/a0, b2/a0, a1/a0, a2/a0
+
+
+def _coeffs_high_shelf(freq: float, gain_db: float, sr: int):
+    A     = 10 ** (gain_db / 40.0)
+    w0    = 2.0 * math.pi * max(1.0, freq) / sr
+    alpha = math.sin(w0) / 2.0 * math.sqrt(2.0)
+    c, sq = math.cos(w0), 2.0 * math.sqrt(A) * alpha
+    b0 =  A * ((A+1) + (A-1)*c + sq);  b1 = -2*A * ((A-1) + (A+1)*c);  b2 = A * ((A+1) + (A-1)*c - sq)
+    a0 =      (A+1) - (A-1)*c + sq;    a1 =  2  * ((A-1) - (A+1)*c);   a2 =     (A+1) - (A-1)*c - sq
+    return b0/a0, b1/a0, b2/a0, a1/a0, a2/a0
+
+
+def _coeffs_peak_eq(freq: float, gain_db: float, Q: float, sr: int):
+    A     = 10 ** (gain_db / 40.0)
+    w0    = 2.0 * math.pi * max(1.0, freq) / sr
+    alpha = math.sin(w0) / (2.0 * max(0.1, Q))
+    c     = math.cos(w0)
+    b0 = 1 + alpha*A;  b1 = -2*c;  b2 = 1 - alpha*A
+    a0 = 1 + alpha/A;  a1 = -2*c;  a2 = 1 - alpha/A
+    return b0/a0, b1/a0, b2/a0, a1/a0, a2/a0
+
+
+def _coeffs_lowpass(freq: float, sr: int, Q: float = 0.707):
+    w0    = 2.0 * math.pi * max(1.0, min(freq, sr * 0.49)) / sr
+    alpha = math.sin(w0) / (2.0 * Q)
+    c     = math.cos(w0)
+    b0 = (1-c)/2;  b1 = 1-c;  b2 = (1-c)/2
+    a0 = 1+alpha;  a1 = -2*c; a2 = 1-alpha
+    return b0/a0, b1/a0, b2/a0, a1/a0, a2/a0
+
+
+_AMP_MODELS = [
+    "Fender Clean",
+    "Vox AC30",
+    "Marshall Crunch",
+    "Mesa Boogie Lead",
+    "Orange Dirty",
+]
+
+# Defaults de EQ, saturación y freq de corte del cabinet por modelo
+_AMP_DEFAULTS: Dict[str, Dict] = {
+    "Fender Clean":     {"gain": 3.0,  "bass":  3.0, "mid":  0.0, "treble":  3.0, "presence": 2.0, "volume": 1.2, "cab_hz": 6500.0},
+    "Vox AC30":         {"gain": 7.0,  "bass": -1.0, "mid": -3.0, "treble":  5.0, "presence": 5.0, "volume": 1.2, "cab_hz": 7000.0},
+    "Marshall Crunch":  {"gain": 15.0, "bass":  4.0, "mid": -2.0, "treble":  6.0, "presence": 5.0, "volume": 1.0, "cab_hz": 5000.0},
+    "Mesa Boogie Lead": {"gain": 28.0, "bass":  5.0, "mid": -5.0, "treble":  7.0, "presence": 3.0, "volume": 0.8, "cab_hz": 5500.0},
+    "Orange Dirty":     {"gain": 20.0, "bass":  6.0, "mid": -4.0, "treble":  4.0, "presence": 3.0, "volume": 0.9, "cab_hz": 4800.0},
+}
+
+
+class AmpProcessor:
+    """
+    Simulador de amplificador de guitarra.
+    Cadena: Input → Saturación tanh (pre-amp) → Tone stack (bass/mid/treble)
+            → Presence → Cabinet sim (lowpass) → Volumen de salida.
+    """
+
+    _N_STATES = 5   # bass_shelf, mid_peak, treble_shelf, presence_peak, cab_lpf
+
+    def __init__(self):
+        self.gain     = 5.0
+        self.bass     = 0.0
+        self.mid      = 0.0
+        self.treble   = 0.0
+        self.presence = 2.0
+        self.volume   = 1.0
+        self.cab_hz   = 6000.0
+        self._model_idx = 0
+        self._states  = [[0.0, 0.0] for _ in range(self._N_STATES)]
+
+    @property
+    def model_idx(self) -> float:
+        return float(self._model_idx)
+
+    @model_idx.setter
+    def model_idx(self, value: float):
+        self._model_idx = int(round(float(value))) % len(_AMP_MODELS)
+        self._states = [[0.0, 0.0] for _ in range(self._N_STATES)]
+
+    def __call__(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
+        # 1. Pre-amp: saturación tipo tubo (tanh soft-clip)
+        saturated = np.tanh(audio * (self.gain * 0.15)).astype(np.float32)
+
+        # 2. Tone stack
+        saturated = _biquad_apply(saturated,
+            *_coeffs_low_shelf(250.0, self.bass, sample_rate), self._states[0])
+        saturated = _biquad_apply(saturated,
+            *_coeffs_peak_eq(800.0, self.mid, 0.8, sample_rate), self._states[1])
+        saturated = _biquad_apply(saturated,
+            *_coeffs_high_shelf(3200.0, self.treble, sample_rate), self._states[2])
+
+        # 3. Presence
+        if self.presence > 0.1:
+            saturated = _biquad_apply(saturated,
+                *_coeffs_peak_eq(4500.0, self.presence, 1.5, sample_rate), self._states[3])
+
+        # 4. Cabinet simulation (lowpass modelado por modelo)
+        saturated = _biquad_apply(saturated,
+            *_coeffs_lowpass(self.cab_hz, sample_rate), self._states[4])
+
+        # 5. Volumen de salida
+        return (saturated * self.volume).astype(np.float32)
+
+
+def _make_amp(params: dict) -> AmpProcessor:
+    a = AmpProcessor()
+    for k, v in params.items():
+        setattr(a, k, v)
+    return a
+
+
 # ─── Definicion de pedales disponibles ───────────────────────────────────────
 #  "params" define cada control: su nombre en el plugin, label, rango y default.
 PEDALS: Dict[str, Any] = {
@@ -231,6 +365,24 @@ PEDALS: Dict[str, Any] = {
         "color": "#880E4F",
         "params": {
             "semitones": {"label": "Semitonos", "min": -12.0, "max": 12.0, "default": 0.0, "unit": " st"},
+        },
+    },
+    "Amplificador": {
+        "factory": _make_amp,
+        "custom": True,
+        "color": "#795548",
+        "params": {
+            "model_idx": {
+                "label": "Modelo", "min": 0.0, "max": 4.0, "default": 0.0, "unit": "",
+                "cycle": True, "cycle_names": _AMP_MODELS,
+            },
+            "gain":     {"label": "Ganancia",  "min": 1.0,   "max": 40.0,  "default": 5.0,    "unit": ""},
+            "bass":     {"label": "Graves",    "min": -12.0, "max": 12.0,  "default": 0.0,    "unit": " dB"},
+            "mid":      {"label": "Medios",    "min": -12.0, "max": 12.0,  "default": 0.0,    "unit": " dB"},
+            "treble":   {"label": "Agudos",    "min": -12.0, "max": 12.0,  "default": 0.0,    "unit": " dB"},
+            "presence": {"label": "Presencia", "min": 0.0,   "max": 10.0,  "default": 2.0,    "unit": " dB"},
+            "volume":   {"label": "Volumen",   "min": 0.0,   "max": 2.0,   "default": 1.0,    "unit": ""},
+            "cab_hz":   {"label": "Cab. Hz",   "min": 3000.0,"max": 8000.0,"default": 6000.0, "unit": " Hz", "hidden": True},
         },
     },
     "Wah": {
@@ -509,6 +661,7 @@ PEDAL_STYLES: Dict[str, Any] = {
     "Filtro Graves":   {"brand": "EHX",    "model": "Bass Boost","body": "#1b5e20", "accent": "#003300", "knob_color": "#111111", "knobs": ["FREQ"]},
     "Pitch Shift":     {"brand": "BOSS",   "model": "PS-6",      "body": "#6a1b9a", "accent": "#4a0072", "knob_color": "#111111", "knobs": ["PITCH", "MODE"]},
     "Wah":             {"brand": "DUNLOP", "model": "Cry Baby",  "body": "#c8860a", "accent": "#8a5e00", "knob_color": "#1a1a1a", "knobs": ["Q", "VOL"]},
+    "Amplificador":    {"brand": "MESA",   "model": "Boogie Mk V","body": "#1e1208", "accent": "#5a3a0a", "knob_color": "#c8a040", "knobs": ["GAIN", "MID", "VOL"]},
 }
 
 
@@ -1129,6 +1282,10 @@ class GuitarPedalboardApp(tk.Tk):
 
         # Un control por parametro
         for key, meta in defn["params"].items():
+            # Parámetros ocultos (gestionados internamente, ej. cab_hz del amp)
+            if meta.get("hidden"):
+                continue
+
             # Visibilidad condicional (usado por el Wah para ocultar params segun modo)
             visible_when = meta.get("visible_when")
             if visible_when is not None and not visible_when(pedal.params):
@@ -1136,6 +1293,32 @@ class GuitarPedalboardApp(tk.Tk):
 
             sect = tk.Frame(self.editor_scroll_frame, bg=BG_PANEL)
             sect.pack(fill="x", pady=5)
+
+            # ── Cycle (selector de modelo de amp) ─────────────────────────
+            if meta.get("cycle"):
+                names = meta["cycle_names"]
+                idx   = int(round(pedal.params[key])) % len(names)
+                tk.Label(sect, text=meta["label"], bg=BG_PANEL, fg=FG_DIM,
+                         font=FONT_SMALL, anchor="w").pack(fill="x")
+
+                def _make_cycle_cb(k=key, p=pedal, ns=names):
+                    def _cycle():
+                        new_idx = (int(round(p.params[k])) + 1) % len(ns)
+                        p.set_param(k, float(new_idx))
+                        model_name = ns[new_idx]
+                        if model_name in _AMP_DEFAULTS:
+                            for ck, cv in _AMP_DEFAULTS[model_name].items():
+                                p.set_param(ck, cv)
+                        self._push_chain()
+                        self._build_editor(p)
+                    return _cycle
+
+                tk.Button(sect, text=f"◀   {names[idx]}   ▶",
+                          bg="#2a1a08", fg="#c8a040",
+                          font=FONT_BOLD, relief="flat", pady=8, cursor="hand2",
+                          activebackground="#3a2a12",
+                          command=_make_cycle_cb()).pack(fill="x")
+                continue
 
             # ── Toggle (ej. Auto/Manual del Wah) ──────────────────────────
             if meta.get("toggle"):
