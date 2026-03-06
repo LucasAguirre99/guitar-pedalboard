@@ -8,22 +8,6 @@ Conectá tu interfaz de audio USB, armá tu cadena de efectos y tocá con el son
 
 ---
 
-## Capturas de pantalla
-
-> **Nota para colaboradores:** las capturas se encuentran en la carpeta `docs/screenshots/`.
-> Si estás contribuyendo y mejorás la interfaz, actualizá las imágenes con `gnome-screenshot` o `scrot`.
-
-### Vista principal — cadena vacía
-![Vista principal](docs/screenshots/main_empty.png)
-
-### Cadena de efectos con pedales activos
-![Cadena con pedales](docs/screenshots/chain_active.png)
-
-### Editor de parámetros
-![Editor de parámetros](docs/screenshots/editor_params.png)
-
----
-
 ## Características
 
 - **11 efectos en tiempo real**: Distorsión, Overdrive, Reverb, Delay, Chorus, Phaser, Compresor, Puerta de Ruido, Filtro de Agudos, Filtro de Graves, Pitch Shift y control de Volumen

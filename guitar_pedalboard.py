@@ -197,6 +197,60 @@ class ActivePedal:
         self._plugin = defn["factory"](self.params)
 
 
+# ─── Afinador — deteccion de pitch ───────────────────────────────────────────
+
+NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+_TUNER_BUF_SIZE = 8192   # ~186 ms a 44100 Hz — suficiente para detectar E2 (82 Hz)
+_TUNER_MIN_FREQ = 60.0   # Hz  (por debajo del Mi grave con afinacion baja)
+_TUNER_MAX_FREQ = 1400.0 # Hz  (cubrir hasta el Mi agudo en el traste 24)
+
+
+def _detect_pitch(audio: np.ndarray, sample_rate: int):
+    """
+    Deteccion de pitch por autocorrelacion via FFT.
+    Devuelve (freq_hz, nota, octava, cents) o None si la senal es muy debil.
+    """
+    audio = audio - audio.mean()
+    if np.sqrt(np.mean(audio ** 2)) < 0.008:
+        return None
+
+    n = len(audio)
+    # Autocorrelacion rapida via FFT
+    fft = np.fft.rfft(audio, n=2 * n)
+    acf = np.fft.irfft(fft * np.conj(fft))[:n]
+    if acf[0] == 0:
+        return None
+    acf /= acf[0]
+
+    min_lag = max(1, int(sample_rate / _TUNER_MAX_FREQ))
+    max_lag = min(n - 1, int(sample_rate / _TUNER_MIN_FREQ))
+    if min_lag >= max_lag:
+        return None
+
+    search = acf[min_lag:max_lag]
+    peak_rel = int(np.argmax(search))
+    lag = peak_rel + min_lag
+
+    if acf[lag] < 0.35:   # correlacion insuficiente = nota no confiable
+        return None
+
+    # Interpolacion parabolica para precision sub-muestra
+    if 0 < peak_rel < len(search) - 1:
+        y1, y2, y3 = search[peak_rel - 1], search[peak_rel], search[peak_rel + 1]
+        denom = 2 * y2 - y1 - y3
+        if denom != 0:
+            lag = lag + (y3 - y1) / (2 * denom)
+
+    freq = sample_rate / lag
+    semitones = 12 * np.log2(freq / 440.0)
+    nearest = round(semitones)
+    cents = (semitones - nearest) * 100
+    midi = int(nearest) + 69
+    note = NOTE_NAMES[midi % 12]
+    octave = midi // 12 - 1
+    return freq, note, octave, float(cents)
+
+
 # ─── Motor de audio ───────────────────────────────────────────────────────────
 
 class AudioEngine:
@@ -214,6 +268,15 @@ class AudioEngine:
         self.running = False
         self.error: Optional[str] = None
         self._sample_rate = 44100
+        # Afinador
+        self._tuner_buf = np.zeros(_TUNER_BUF_SIZE, dtype="float32")
+        self._tuner_pos = 0
+        self._tuner_result = None   # (freq, nota, octava, cents) o None
+        self._tuner_lock = threading.Lock()
+
+    def get_tuner(self):
+        with self._tuner_lock:
+            return self._tuner_result
 
     @staticmethod
     def input_devices() -> List[str]:
@@ -231,10 +294,23 @@ class AudioEngine:
         with self._lock:
             pb = self._pedalboard
         # indata: (frames, 2) float32 — mezclar a mono y procesar
-        # La guitarra entra en L y R, promediarlos para obtener mono
         mono = indata.mean(axis=1, keepdims=True).T  # (1, frames)
+
+        # Alimentar buffer del afinador con audio crudo (antes de efectos)
+        raw = mono[0]
+        n = len(raw)
+        space = _TUNER_BUF_SIZE - self._tuner_pos
+        if n >= space:
+            self._tuner_buf[self._tuner_pos:] = raw[:space]
+            result = _detect_pitch(self._tuner_buf.copy(), self._sample_rate)
+            with self._tuner_lock:
+                self._tuner_result = result
+            self._tuner_pos = 0
+        else:
+            self._tuner_buf[self._tuner_pos:self._tuner_pos + n] = raw
+            self._tuner_pos += n
+
         processed = pb(mono, self._sample_rate, reset=False)
-        # Duplicar a estéreo para la salida
         if processed.shape[0] == 1:
             processed = np.repeat(processed, 2, axis=0)
         outdata[:] = processed.T[:frames]
@@ -480,6 +556,7 @@ class GuitarPedalboardApp(tk.Tk):
         self.editor_scroll_frame.pack(fill="both", expand=True, padx=12)
 
         self._show_editor_placeholder()
+        self._build_tuner_panel()
 
     # ── Helpers de layout ─────────────────────────────────────────────────────
 
@@ -748,6 +825,104 @@ class GuitarPedalboardApp(tk.Tk):
             w.destroy()
         tk.Label(self.chain_outer, text=msg, bg=BG, fg="#ff6666",
                  font=("Helvetica", 11), justify="left").pack(expand=True)
+
+    # ── Afinador UI ───────────────────────────────────────────────────────────
+
+    def _build_tuner_panel(self):
+        tk.Frame(self.editor_frame, bg="#2a2a4a", height=1).pack(fill="x", padx=10, pady=(8, 0))
+
+        tuner = tk.Frame(self.editor_frame, bg=BG_PANEL)
+        tuner.pack(fill="x", padx=10, pady=(6, 10))
+
+        tk.Label(tuner, text="AFINADOR", bg=BG_PANEL, fg=FG_DIM,
+                 font=("Helvetica", 8, "bold")).pack()
+
+        # Nota grande
+        self._tuner_note_lbl = tk.Label(
+            tuner, text="--", bg=BG_PANEL, fg="#444466",
+            font=("Helvetica", 36, "bold"),
+        )
+        self._tuner_note_lbl.pack()
+
+        # Frecuencia
+        self._tuner_freq_lbl = tk.Label(
+            tuner, text="--- Hz", bg=BG_PANEL, fg=FG_DIM, font=FONT_SMALL,
+        )
+        self._tuner_freq_lbl.pack()
+
+        # Barra de cents
+        self._tuner_canvas = tk.Canvas(
+            tuner, bg="#111122", height=28, highlightthickness=1,
+            highlightbackground="#2a2a4a",
+        )
+        self._tuner_canvas.pack(fill="x", pady=(6, 2))
+        self._tuner_canvas.bind("<Configure>", lambda e: self._draw_tuner_bar(None))
+
+        # Etiquetas de referencia
+        ref = tk.Frame(tuner, bg=BG_PANEL)
+        ref.pack(fill="x")
+        tk.Label(ref, text="-50", bg=BG_PANEL, fg="#444", font=("Helvetica", 7)).pack(side="left")
+        tk.Label(ref, text="EN TONO", bg=BG_PANEL, fg="#444", font=("Helvetica", 7)).pack(side="left", expand=True)
+        tk.Label(ref, text="+50", bg=BG_PANEL, fg="#444", font=("Helvetica", 7)).pack(side="right")
+
+        # Arrancar el polling
+        self.after(120, self._update_tuner)
+
+    def _draw_tuner_bar(self, cents: Optional[float]):
+        c = self._tuner_canvas
+        c.delete("all")
+        w = c.winfo_width()
+        h = c.winfo_height()
+        if w < 4:
+            return
+
+        # Zonas de color de fondo
+        mid = w // 2
+        zone_w_green  = int(w * 10 / 100)
+        zone_w_yellow = int(w * 25 / 100)
+
+        c.create_rectangle(0,        0, w,                       h, fill="#3a1111", outline="")
+        c.create_rectangle(mid - zone_w_yellow, 0, mid + zone_w_yellow, h, fill="#3a3a11", outline="")
+        c.create_rectangle(mid - zone_w_green,  0, mid + zone_w_green,  h, fill="#113a11", outline="")
+
+        # Linea central
+        c.create_line(mid, 0, mid, h, fill="#335533", width=1)
+
+        if cents is not None:
+            # Aguja: cents va de -50 a +50, mapeado a 0..w
+            clamped = max(-50.0, min(50.0, cents))
+            x = int((clamped + 50) / 100 * w)
+
+            if abs(cents) <= 10:
+                color = "#00ff66"
+            elif abs(cents) <= 25:
+                color = "#ffdd00"
+            else:
+                color = "#ff4444"
+
+            c.create_rectangle(x - 3, 2, x + 3, h - 2, fill=color, outline="")
+
+    def _update_tuner(self):
+        """Polling cada 120 ms para actualizar el panel del afinador."""
+        result = self.engine.get_tuner() if self.engine.running else None
+
+        if result is None:
+            self._tuner_note_lbl.config(text="--", fg="#444466")
+            self._tuner_freq_lbl.config(text="--- Hz")
+            self._draw_tuner_bar(None)
+        else:
+            freq, note, octave, cents = result
+            if abs(cents) <= 10:
+                color = "#00ff66"
+            elif abs(cents) <= 25:
+                color = "#ffdd00"
+            else:
+                color = "#ff4444"
+            self._tuner_note_lbl.config(text=f"{note}{octave}", fg=color)
+            self._tuner_freq_lbl.config(text=f"{freq:.1f} Hz")
+            self._draw_tuner_bar(cents)
+
+        self.after(120, self._update_tuner)
 
     # ── Cierre ────────────────────────────────────────────────────────────────
 
